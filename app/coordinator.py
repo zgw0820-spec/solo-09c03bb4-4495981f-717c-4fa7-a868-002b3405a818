@@ -17,6 +17,28 @@ Ordering guarantees:
   relabelled. A late response therefore stays auditable yet can never become
   ``GET /diagnosis/latest``.
 * ``state_version`` is persisted so a restart never reissues a used version.
+
+Closing configuration verification
+----------------------------------
+
+Probe responses alone cannot prove that a service stayed configured the same
+way until the batch ended. If a service is changed directly (``PUT /_fault``
+on the service, bypassing this API) *after its own probe returned* but while
+another probe is still running, the stale response is internally consistent:
+same ``state_version``, same ``config_epoch``. After all probes finish, the
+batch therefore re-reads every service's admin state and compares the closing
+``config_epoch`` with the pre-probe baseline (or, for a service unreadable at
+baseline, the epoch its own probe reported) and with the configuration the
+batch's ``state_version`` is known to describe. A difference — or a failure to
+perform the check — forces ``needs_retest``; no healthy verdict or root cause
+is published.
+
+This closing check is strictly **read-only**. It must not update
+``_expected_epochs``: the background watcher owns that bookkeeping, and it
+still has to notice the direct change and advance the global state version
+after the batch releases ``_run_lock``. The watcher deliberately skips while a
+batch is running *without* refreshing ``_expected_epochs``, so skipping cannot
+swallow a change.
 """
 from __future__ import annotations
 
@@ -313,6 +335,7 @@ class Coordinator:
                 pre_reasons: list[str] = []
                 async with self._state_lock:
                     version_before = self.state_version
+                version_after = version_before
                 if version_before != expected_version:
                     pre_reasons.append(
                         f"global state version changed from {expected_version} to "
@@ -336,8 +359,26 @@ class Coordinator:
                             if state.get("reachable")
                         }
                         probes = await client.probe_all()
+                        # Closing configuration check. Probe responses are only
+                        # evidence about the moment each probe answered; a
+                        # direct edit after a service's probe returned but
+                        # before the rest finished would still look internally
+                        # consistent. Re-read every service's admin state now
+                        # that all probes are done. Holding the state lock for
+                        # the check means a fault injected through this API
+                        # cannot land halfway through it and produce a torn
+                        # read across services.
+                        async with self._state_lock:
+                            closing_reasons = await self._closing_config_check(
+                                client, baseline_epochs, probes, expected_version
+                            )
                     finally:
                         await self._close_client(client)
+                    pre_reasons.extend(closing_reasons)
+                    # Read the version again before the verdict is reduced: a
+                    # change applied after the closing check still invalidates
+                    # a confident verdict, since no boundary of this batch has
+                    # been observed beyond it.
                     async with self._state_lock:
                         version_after = self.state_version
                     if version_after != expected_version:
@@ -350,7 +391,7 @@ class Coordinator:
                     assessment = evaluate(
                         probes,
                         expected_version=expected_version,
-                        current_version=self.state_version,
+                        current_version=version_after,
                         baseline_epochs=baseline_epochs,
                         probe_timeout_seconds=self.settings.probe_timeout_seconds,
                     )
@@ -443,6 +484,112 @@ class Coordinator:
             async with self._batch_lock:
                 if self._active.get(batch_id) is asyncio.current_task():
                     self._active.pop(batch_id, None)
+
+    async def _closing_config_check(
+        self,
+        client: ServiceClient,
+        baseline_epochs: dict[str, int | None],
+        probes: dict[str, Any],
+        expected_version: int,
+    ) -> list[str]:
+        """Re-read the services' configuration after probing (read-only).
+
+        This catches a direct ``PUT /_fault`` that landed *after* a service's
+        own probe answered but before the other probes finished: both probe
+        endpoints would still agree with the baseline epoch and the batch
+        version, yet the service is no longer configured the way it was
+        measured. A service that was unreachable at baseline is taken from the
+        epoch carried by its own probe response instead (a reachable probe
+        reports ``config_epoch``); a service with no configuration reference at
+        all is skipped, since its probe evidence (unreachable / timeout)
+        already speaks for itself. A service that was measured but cannot be
+        read now makes the batch unverifiable, which is itself a retest reason.
+
+        The closing epoch is compared with two references:
+
+        * the baseline read taken before the probes started — catches a change
+          that landed after that service's own probe answered;
+        * ``_expected_epochs``, the configuration the current global
+          ``state_version`` is known to describe — catches a direct change that
+          the watcher has not stamped into the version yet (probing began with
+          a stale version).
+
+        The check performs no writes and never touches ``_expected_epochs``:
+        the watcher must still observe the direct change once ``_run_lock`` is
+        released and advance the global state version.
+        """
+        try:
+            states = await client.snapshot_states()
+        except Exception as exc:  # defensive: verification must not crash a batch
+            return [
+                f"{service}: could not verify configuration after probing "
+                f"({type(exc).__name__}: {exc}); a direct change during this "
+                "batch cannot be ruled out"
+                for service in SERVICES
+                if self._measured_epoch(service, baseline_epochs, probes) is not None
+            ]
+
+        observed = {state["service"]: state for state in states}
+        reasons: list[str] = []
+        for service in SERVICES:
+            reference = self._measured_epoch(service, baseline_epochs, probes)
+            if reference is None:
+                continue
+            state = observed.get(service) or {}
+            if not state.get("reachable") or state.get("config_epoch") is None:
+                reasons.append(
+                    f"{service}: could not verify configuration after probing "
+                    f"({state.get('error') or 'admin state unavailable'}); a "
+                    "direct change during this batch cannot be ruled out"
+                )
+                continue
+            closing_epoch = state["config_epoch"]
+            if closing_epoch != reference:
+                reasons.append(
+                    f"{service}: configuration changed during this batch "
+                    f"(config_epoch {reference} -> {closing_epoch} observed after "
+                    "probing); its probe responses no longer describe the "
+                    "current configuration, even though their state_version "
+                    f"{probes.get(service, {}).get('state_version')!r} matches "
+                    f"{expected_version}"
+                )
+                continue
+            expected_epoch = self._expected_epochs.get(service)
+            if expected_epoch is not None and closing_epoch != expected_epoch:
+                reasons.append(
+                    f"{service}: configuration (config_epoch {closing_epoch}) does "
+                    f"not match the configuration that global state version "
+                    f"{expected_version} was known to describe (config_epoch "
+                    f"{expected_epoch}); a direct change has not been stamped "
+                    "into the state version yet"
+                )
+        return reasons
+
+    @staticmethod
+    def _measured_epoch(
+        service: str,
+        baseline_epochs: dict[str, int | None],
+        probes: dict[str, Any],
+    ) -> int | None:
+        """Configuration epoch this batch measured for ``service``, if any.
+
+        Prefer the read taken immediately before probing; fall back to the
+        epoch the service's own probe answered with (covers a service whose
+        admin endpoint was unreachable for the baseline read but whose health
+        endpoints still answered).
+        """
+        baseline = baseline_epochs.get(service)
+        if baseline is not None:
+            return baseline
+        probe = probes.get(service) or {}
+        epochs = {
+            ev.get("config_epoch")
+            for endpoint in ("live", "ready")
+            for ev in [probe.get(endpoint) or {}]
+            if ev.get("config_epoch") is not None
+        }
+        # Only a single, unambiguous epoch can serve as a reference.
+        return next(iter(epochs)) if len(epochs) == 1 else None
 
     def _younger_batch_seq(self, seq: int) -> int | None:
         latest = self.store.latest_batch()

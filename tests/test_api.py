@@ -218,6 +218,128 @@ def test_async_batch_and_supersession(client: httpx.Client, stack):
             assert detail["superseded_by"] is None
 
 
+def test_direct_edit_after_a_service_probe_returned_forces_retest(
+    client: httpx.Client, stack
+):
+    """The race from the incident: auth's probe finishes, then a direct edit.
+
+    ``PUT /_fault`` is sent straight to auth while order's probe is still in
+    flight. Auth's own probe already answered with the batch's state version and
+    the pre-probe config epoch, so without a closing check the batch would say
+    ``healthy``. It must instead be ``needs_retest`` with no root cause, and the
+    watcher must still adopt the change and advance the state version.
+    """
+    reset(client)
+    assert set_fault(client, "auth", probe_delay_ms=0).status_code == 200
+    # order's probe stays in flight long enough for the direct edit.
+    assert set_fault(client, "order", probe_delay_ms=1500).status_code == 200
+    before = client.get("/state").json()["state_version"]
+
+    started = client.post("/diagnosis", params={"wait": "false"})
+    assert started.status_code == 202, started.text
+    batch = started.json()
+    # auth answers immediately, order needs ~1.5s: edit auth while the batch is
+    # still probing, after auth's own probe must already have returned.
+    time.sleep(0.4)
+    direct = httpx.put(f"{stack.url('auth')}/_fault", json={"ready_ok": False})
+    assert direct.status_code == 200
+    assert direct.json()["config_epoch"] > 1
+
+    deadline = time.monotonic() + 20
+    record = None
+    while time.monotonic() < deadline:
+        record = client.get(f"/diagnosis/{batch['batch_id']}").json()
+        if record["status"] != "running":
+            break
+        time.sleep(0.1)
+    assert record is not None and record["status"] == "completed"
+    result = record["result"]
+
+    assert record["outcome"] == "needs_retest", result
+    assert result["root_causes"] == []
+    assert result["independent_faults_count"] == 0
+    assert result["primary_root_cause"] is None
+    assert result["affected_services"] == []
+    joined = " ".join(result["retest_reasons"])
+    assert "configuration changed during this batch" in joined
+    assert "auth" in joined
+    # Auth's probe really did look consistent with the batch: this is the race.
+    assert result["probes"]["auth"]["state_version"] == batch["state_version"]
+    assert result["probes"]["auth"]["live"]["ok"] is True
+
+    # The listener must still take the direct change and move the version on.
+    deadline = time.monotonic() + 5
+    after = client.get("/state").json()["state_version"]
+    while time.monotonic() < deadline:
+        after = client.get("/state").json()["state_version"]
+        if after > before:
+            break
+        time.sleep(0.1)
+    assert after > before
+    auth_state = next(
+        s for s in client.get("/state").json()["service_states"] if s["service"] == "auth"
+    )
+    assert auth_state["ready_ok"] is False
+    assert auth_state["state_version"] == after
+
+    # Clear order's artificial delay, which would otherwise (correctly) make a
+    # fresh batch ask for a retest via gateway's dependency-check timeout.
+    assert set_fault(client, "order", probe_delay_ms=0).status_code == 200
+
+    # A fresh batch now sees the change and reports it as the root cause.
+    follow_up = diagnose(client)
+    assert follow_up["outcome"] == "root_cause_found", follow_up["result"][
+        "retest_reasons"
+    ]
+    assert follow_up["result"]["primary_root_cause"] == "auth"
+
+
+def test_retest_batch_is_still_superseded_by_newer_batch(
+    client: httpx.Client, stack
+):
+    """A racing batch must be stored as needs_retest *and* stay supersedable.
+
+    The old batch is kept for audit and never becomes the latest result, while
+    the newer batch is the one that carries the verdict.
+    """
+    reset(client)
+    assert set_fault(client, "order", probe_delay_ms=1500).status_code == 200
+
+    first = client.post("/diagnosis", params={"wait": "false"})
+    assert first.status_code == 202
+    first_body = first.json()
+    time.sleep(0.4)
+    # Direct edit after auth's probe has returned, while order is still probing.
+    assert httpx.put(
+        f"{stack.url('auth')}/_fault", json={"ready_ok": False}
+    ).status_code == 200
+    second = client.post("/diagnosis", params={"wait": "false"})
+    assert second.status_code == 202
+    second_body = second.json()
+    assert second_body["seq"] > first_body["seq"]
+
+    deadline = time.monotonic() + 25
+    first_record = second_record = None
+    while time.monotonic() < deadline:
+        first_record = client.get(f"/diagnosis/{first_body['batch_id']}").json()
+        second_record = client.get(f"/diagnosis/{second_body['batch_id']}").json()
+        if first_record["status"] != "running" and second_record["status"] != "running":
+            break
+        time.sleep(0.1)
+
+    assert first_record["status"] == "completed"
+    assert first_record["outcome"] == "needs_retest"
+    assert first_record["result"]["root_causes"] == []
+    assert first_record["superseded"] is True
+    assert first_record["superseded_by"] == second_body["seq"]
+
+    # The older batch is still readable, but the newest result is the second.
+    assert second_record["status"] == "completed"
+    latest = client.get("/diagnosis/latest").json()
+    assert latest["batch_id"] == second_body["batch_id"]
+    assert latest["superseded"] is False
+
+
 def test_wait_budget_expiry_returns_202_then_poll_succeeds(client: httpx.Client):
     reset(client)
     assert set_fault(client, "cache", probe_delay_ms=700).status_code == 200
